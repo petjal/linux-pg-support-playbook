@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Megan's Rule Reference Verification Container
-# Verifies Question 1 (Linux User Audit + Smart Diff under 520-user load & cron env -i)
-# and Question 3 (Git Commit Graph Reproduction from an empty directory).
+# Verifies Linux User Audit + Smart Diff under 520-user load & cron env -i
+# and Git Commit Graph Reproduction from an empty directory.
 
 FROM debian:bookworm-slim
 
@@ -19,7 +19,7 @@ RUN for i in $(seq 1 500); do \
       useradd -M -d "/home/corpuser_${i}" -s /bin/bash "corpuser_${i}"; \
     done
 
-# Verify Question 1 under cron's stripped environment (env -i) and Question 3 Git graph
+# Verify user audit daemon under cron's stripped environment (env -i) and Git commit graph
 RUN /usr/bin/env -i /usr/local/bin/check_user_changes.sh && \
     /usr/bin/env -i /usr/local/bin/check_user_changes.sh && \
     useradd -m -d /home/gitlab_support -s /bin/bash gitlab_support && \

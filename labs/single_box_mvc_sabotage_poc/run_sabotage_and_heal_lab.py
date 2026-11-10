@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Single-Box MVC + PostgreSQL 17 Performance Sabotage & Autonomous AI Triage PoC.
 
-Simulates Question 2 of the GitLab Support Engineer Assessment inside a constrained
+Simulates a production single-box MVC + PostgreSQL degradation inside a constrained
 2-vCPU, 2 GB RAM container environment running PostgreSQL 17.11 + an MVC endpoint:
   1. Seeds a GitLab-style group/project SBOM dependency schema (200 projects,
      40,000 live sbom_occurrences rows + 60,000 dead tuples from unvacuumed churn).
