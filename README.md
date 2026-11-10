@@ -57,11 +57,11 @@ When triaging complex multi-tier incidents, pulling logs from only one layer lea
 3. **Database Tier:** PostgreSQL error logs (`log_min_duration_statement`, lock timeouts, autovacuum completion logs, and deadlocks).
 4. **Operating System Tier:** `/var/log/messages`, `dmesg -T` (OOM-killer invocations, filesystem driver warnings), and `journalctl -u <service>`.
 
-### Principle 5: Putting AI Directly on the Box ("One-Hoss Shay" Replica Lab & Case Queue Automation)
+### Principle 5: Putting AI Directly on the Box ("One-Hoss Shay" / `tbintdb` Replica Lab & Case Queue Automation)
 Modern AI models excel at synthesizing patterns across dense, multi-service log dumps and live server telemetry when given deterministic, UTC-normalized inputs:
 - **Strict UTC/Zulu (`Z`) Sub-Second Timestamps:** Mismatched local timezones are the bane of distributed systems support. Normalize all disparate log streams and audit scripts to **ISO-8601 UTC (`date -u` with trailing `Z`)** with **millisecond (`.%3NZ`)** or **nanosecond (`.%9NZ`)** precision so sub-second cross-container events order deterministically.
 - **Chronological Interlacing & 5-Minute Heartbeats (`HEARTBEAT_5M`):** Interlace logs across all four tiers and emit synthetic 5-minute UTC heartbeat boundaries summarizing error and warning counts to point the AI directly at the earliest anomaly spike ("Look Left").
-- **The Terabyte-Scale "AI-on-the-Box" Replica Lab ("One-Hoss Shay"):** Rather than guessing at customer bottlenecks from static text tickets, stand up a production-scale lab server (1.1 TB to 1.25 TB database replica populated with complex, high-scale repositories) and place an AI diagnostic agent directly on the box with read access to live Linux telemetry, container cgroups, PostgreSQL catalogs, and product source code.
+- **The Terabyte-Scale "AI-on-the-Box" Replica Lab (`tbintdb` / "One-Hoss Shay"):** Rather than guessing at customer bottlenecks from static text tickets, stand up a production-scale lab server (`tbintdb`, an internal benchmark project hosted on our self-managed GitLab instance and backed by a 1.1 TB to 1.25 TB database replica populated with complex, high-scale repositories) and place an AI diagnostic agent directly on the box with read access to live Linux telemetry, container cgroups, PostgreSQL catalogs, and product source code.
 - **End-to-End Case Queue Velocity (`2X` Capacity):** Pairing the lab replica with AI case-queue automation (prioritizing incoming tickets by SLA/MBO metrics, pulling case attachments, cross-searching historical tickets, KnowledgeBase articles, Jira, Confluence, and source code, reproducing on the lab VM, and filing engineering defect tickets with exact source filenames and line numbers) transforms support throughput while uncovering deep architectural fixes.
 
 ---
@@ -122,6 +122,11 @@ Three architectural patterns resolve these bottlenecks on constrained servers:
 - **Pattern B (Relational SQL Pushdown):** 1 query executed in **1.731 ms**.
 - **Measured Speedup:** **4.1x faster execution** with 100% data verification match.
 
+#### Verified Containerized Single-Box Sabotage & Autonomous AI Triage PoC (`labs/single_box_mvc_sabotage_poc/run_sabotage_and_heal_lab.py`):
+- **Container Environment:** `--cpus="2.0" --memory="2g" --cap-add=NET_ADMIN` on `postgres:17-alpine` (`PostgreSQL 17.11` + `iproute2-tc`).
+- **Sabotaged State (4 Compounding Faults):** `tc qdisc add dev lo root netem delay 5ms` on TCP loopback + 41-query MVC `N+1` loop + `60.0%` dead-tuple bloat (`60,000` dead rows with `autovacuum_enabled = false`) + 2 zero-scan redundant indexes (`idx_scan = 0`) -> **2,808.59 ms** (`1,425` buffers per query = `57,000` buffer hits).
+- **Post-Remediation State (Autonomous AI Diagnosis & Fix):** Removed `tc-netem` delay, switched to Unix domain socket, rewrote 41-query `N+1` loop to single SQL `JOIN` pushdown, created partial covering index `idx_sbom_proj_unarchived_sev` (`Index Only Scan`, `Heap Fetches: 0`), dropped zero-scan indexes, and ran `VACUUM (ANALYZE)` with `autovacuum_vacuum_scale_factor = 0.01` -> **12.63 ms** (`1` query, `92` shared buffer hits, **222.4x speedup**).
+
 ---
 
 ## 4. Live GitLab Source-Code Triage Demonstration (November 9, 2026)
@@ -154,10 +159,12 @@ linux-pg-support-playbook/
 │       ├── pg_advisor.py                  # Linux and PostgreSQL configuration and telemetry advisor
 │       └── sql_pushdown_demo.py           # Runnable SQLite benchmark comparing N+1 vs. SQL pushdown
 ├── labs/
-│   └── linux_user_audit_container/
-│       ├── Dockerfile                     # Megan's Rule reference verification container
-│       ├── list_users.sh                  # Portable Linux user audit script
-│       └── check_user_changes.sh          # Idempotent MD5 change detection daemon for cron
+│   ├── linux_user_audit_container/
+│   │   ├── Dockerfile                     # Megan's Rule reference verification container (Q1 & Q3)
+│   │   ├── list_users.sh                  # Portable Linux user audit script
+│   │   └── check_user_changes.sh          # Idempotent MD5 change detection + unified diff logger
+│   └── single_box_mvc_sabotage_poc/
+│       └── run_sabotage_and_heal_lab.py   # Live PostgreSQL 17 + tc-netem sabotage & AI triage PoC
 └── tests/
     └── test_support_playbook.py           # Comprehensive pytest suite verifying all components
 ```

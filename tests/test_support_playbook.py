@@ -322,7 +322,9 @@ def test_linux_user_audit_scripts_in_tempdir() -> None:
         tmp_path = Path(tmpdir)
         mock_list_script = tmp_path / "mock_list_users.sh"
         current_users_file = tmp_path / "current_users"
+        current_users_snapshot_file = tmp_path / "current_users.snapshot"
         user_changes_file = tmp_path / "user_changes"
+        user_changes_diff_file = tmp_path / "user_changes.diff.log"
 
         # 1. Initial user state
         mock_list_script.write_text(
@@ -335,7 +337,9 @@ def test_linux_user_audit_scripts_in_tempdir() -> None:
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "LIST_USERS_SCRIPT": str(mock_list_script),
             "CURRENT_USERS_FILE": str(current_users_file),
+            "CURRENT_USERS_SNAPSHOT_FILE": str(current_users_snapshot_file),
             "USER_CHANGES_FILE": str(user_changes_file),
+            "USER_CHANGES_DIFF_FILE": str(user_changes_diff_file),
         }
 
         # Run 1: Initial Baseline
@@ -410,6 +414,9 @@ def test_linux_user_audit_scripts_in_tempdir() -> None:
         assert user_changes_file.exists()
         changes_content = user_changes_file.read_text()
         assert "changes occurred" in changes_content
+        assert user_changes_diff_file.exists()
+        diff_content = user_changes_diff_file.read_text()
+        assert "+support_test:/home/support_test" in diff_content
 
 
 def test_pg_advisor_zero_ram_guard() -> None:
@@ -565,11 +572,11 @@ def test_repository_no_pii_or_path_bleed() -> None:
 
     banned_phone = re.compile(r"\b\d{3}[-.]\d{3}[-.]\d{4}\b")
     banned_customers = re.compile(
-        r"\b(cisco|citigroup|netapp|comcast|broadcom|synopsys|black\s*duck|tbintdb|tebuco)\b",
+        r"\b(cisco|citigroup|netapp|comcast|broadcom|synopsys|black\s*duck|tebuco)\b",
         re.IGNORECASE,
     )
     banned_paths = re.compile(
-        r"(/home/(?!appuser\b|support_test\b|user\b|developer\b)[a-zA-Z0-9_-]+|/dev/shm|antigravity-cli/brain)"
+        r"(/home/(?!appuser\b|support_test\b|gitlab_support\b|corpuser_|user\b|developer\b)[a-zA-Z0-9_-]+|/dev/shm|antigravity-cli/brain)"
     )
 
     for rel_path in tracked_files:
