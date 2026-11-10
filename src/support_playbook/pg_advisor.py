@@ -6,8 +6,39 @@ churn, and storage/network mount configurations based on field-tested escalation
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional
+import argparse
+import json
+import sys
+from dataclasses import asdict, dataclass, field
+from typing import List, Literal, Optional, Sequence
+
+
+@dataclass
+class LiveWorkloadTelemetry:
+    """Metrics collected from a live running PostgreSQL instance under heavy load."""
+
+    ram_gb: int
+    vcpus: int
+    storage_type: Literal["nvme", "ssd", "hdd"] = "ssd"
+    max_connections: int = 200
+    active_workers: int = 4
+    temp_bytes_written_per_hour: int = 0
+    top_sort_spill_mb: int = 0
+    dead_tuple_ratio_max: float = 0.0
+    hot_table_names: tuple[str, ...] = ()
+    checkpoints_req_per_hour: int = 0
+    zero_scan_index_ratio: float = 0.0
+    network_rtt_ms: float = 0.5
+
+
+@dataclass
+class LiveTuningRecommendation:
+    """Workload-driven configuration recommendations and remediation actions."""
+
+    gitlab_rb_overrides: dict[str, str | int | float]
+    table_storage_sql: list[str]
+    hardware_and_network_actions: list[str]
+    rationale: list[str]
 
 
 @dataclass
@@ -427,3 +458,337 @@ class PgAdvisor:
             lines.append("")
 
         return "\n".join(lines)
+
+    def calculate_live_workload_tunings(
+        self, telemetry: LiveWorkloadTelemetry
+    ) -> LiveTuningRecommendation:
+        """Calculate workload-driven recommendations from live telemetry."""
+        return calculate_live_workload_tunings(telemetry)
+
+
+def calculate_live_workload_tunings(
+    telemetry: LiveWorkloadTelemetry,
+) -> LiveTuningRecommendation:
+    """Calculate production-grade PostgreSQL and GitLab Omnibus tunings from live telemetry.
+
+    Synthesizes single-box memory splits, sort spill metrics, high-churn autovacuum needs,
+    and storage/network characteristics into concrete /etc/gitlab/gitlab.rb overrides
+    and table storage parameters.
+    """
+    overrides: dict[str, str | int | float] = {}
+    table_storage_sql: list[str] = []
+    actions: list[str] = []
+    rationale: list[str] = []
+
+    # 1. shared_buffers & effective_cache_size (25% and 75% memory rules)
+    shared_mb = int(telemetry.ram_gb * 1024 * 0.25)
+    if shared_mb >= 1024:
+        sb_val = f"{shared_mb // 1024}GB"
+    else:
+        sb_val = f"{shared_mb}MB"
+    overrides["postgresql['shared_buffers']"] = sb_val
+    rationale.append(
+        f"postgresql['shared_buffers'] set to 25% of physical RAM ({sb_val}) "
+        "to cache active hot working sets while preserving headroom for OS page cache and worker processes."
+    )
+
+    eff_cache_mb = int(telemetry.ram_gb * 1024 * 0.75)
+    if eff_cache_mb >= 1024:
+        overrides["postgresql['effective_cache_size']"] = f"{eff_cache_mb // 1024}GB"
+    else:
+        overrides["postgresql['effective_cache_size']"] = f"{eff_cache_mb}MB"
+
+    # 2. work_mem computation with safe OOM ceiling
+    base_work_mem_mb = 16
+    safe_cap_mb = max(16, (telemetry.ram_gb * 1024) // max(1, telemetry.active_workers * 4))
+
+    if telemetry.top_sort_spill_mb > 0:
+        target_mb = max(base_work_mem_mb, int(telemetry.top_sort_spill_mb * 2))
+        p = 1
+        while p < target_mb:
+            p <<= 1
+        work_mem_mb = min(p, safe_cap_mb)
+        rationale.append(
+            f"Observed peak sort spill of {telemetry.top_sort_spill_mb} MB to disk. Scaled work_mem to {work_mem_mb}MB "
+            f"(target: {target_mb}MB, safety cap: {safe_cap_mb}MB) to convert external merge sorts to in-memory operations."
+        )
+    elif telemetry.temp_bytes_written_per_hour > 0:
+        work_mem_mb = min(base_work_mem_mb * 2, safe_cap_mb)
+        rationale.append(
+            f"Observed {telemetry.temp_bytes_written_per_hour:,} temp bytes/hr written to disk. Increased work_mem to "
+            f"{work_mem_mb}MB (baseline: {base_work_mem_mb}MB) to suppress temporary file generation."
+        )
+    else:
+        work_mem_mb = min(base_work_mem_mb, safe_cap_mb)
+        rationale.append(
+            f"No sort spills or temp disk writes observed. Keeping baseline work_mem at {work_mem_mb}MB."
+        )
+
+    overrides["postgresql['work_mem']"] = f"{work_mem_mb}MB"
+
+    # 3. Storage I/O concurrency & random_page_cost
+    if telemetry.storage_type in ("nvme", "ssd"):
+        overrides["postgresql['random_page_cost']"] = 1.1
+        overrides["postgresql['effective_io_concurrency']"] = 200
+        rationale.append(
+            f"Flash storage ({telemetry.storage_type.upper()}) detected: set random_page_cost = 1.1 "
+            "and effective_io_concurrency = 200 for non-rotational random seek parity."
+        )
+    else:  # hdd
+        overrides["postgresql['random_page_cost']"] = 4.0
+        overrides["postgresql['effective_io_concurrency']"] = 2
+        actions.append(
+            "CRITICAL STORAGE WARNING: Database is running on rotational HDD storage. "
+            "Migrate PostgreSQL data and WAL to dedicated enterprise SSD or NVMe storage."
+        )
+        rationale.append(
+            "Rotational HDD detected: random_page_cost set to 4.0 and effective_io_concurrency to 2."
+        )
+
+    # 4. Checkpoints & WAL volume
+    if telemetry.checkpoints_req_per_hour > 4:
+        overrides["postgresql['max_wal_size']"] = "16GB"
+        overrides["postgresql['checkpoint_completion_target']"] = 0.9
+        actions.append(
+            f"High forced WAL checkpoint rate ({telemetry.checkpoints_req_per_hour}/hr > 4/hr). "
+            "Ensure WAL volume (/var/opt/gitlab/postgresql/data/pg_wal) has >= 32 GB disk space and dedicated IOPS."
+        )
+        rationale.append(
+            f"Forced checkpoint rate ({telemetry.checkpoints_req_per_hour}/hr) exceeds 4/hr threshold. "
+            "Increased max_wal_size to 16GB and smoothed completion target to 0.9 to prevent disk sync spikes."
+        )
+    else:
+        overrides["postgresql['max_wal_size']"] = "4GB"
+        overrides["postgresql['checkpoint_completion_target']"] = 0.9
+
+    # 5. Dead tuple churn & leaf table autovacuum
+    if telemetry.dead_tuple_ratio_max >= 0.05 and telemetry.hot_table_names:
+        for t in telemetry.hot_table_names:
+            table_storage_sql.append(
+                f"ALTER TABLE {t} SET ("
+                f"autovacuum_vacuum_scale_factor = 0.01, "
+                f"autovacuum_analyze_scale_factor = 0.005, "
+                f"autovacuum_vacuum_cost_limit = 2000);"
+            )
+        rationale.append(
+            f"Peak dead tuple ratio of {telemetry.dead_tuple_ratio_max * 100:.1f}% on hot tables "
+            f"exceeds 5% threshold. Generated aggressive per-table autovacuum parameters (1% vacuum, 0.5% analyze, "
+            f"2000 cost limit) targeting {len(telemetry.hot_table_names)} physical leaf relations to halt table bloat."
+        )
+
+    # 6. Zero-scan index ratio & write amplification
+    if telemetry.zero_scan_index_ratio >= 0.30:
+        actions.append(
+            f"High write amplification detected: {telemetry.zero_scan_index_ratio * 100:.1f}% of index disk footprint "
+            "has zero scans (idx_scan = 0). Audit pg_stat_user_indexes and drop redundant indexes concurrently to "
+            "recover shared buffer cache and eliminate useless B-tree write penalties."
+        )
+        rationale.append(
+            f"Zero-scan index ratio ({telemetry.zero_scan_index_ratio * 100:.1f}%) exceeds 30% threshold. "
+            "Redundant indexes double disk write I/O and evict active table pages from Linux page cache."
+        )
+
+    # 7. Network RTT latency & round-trips
+    if telemetry.network_rtt_ms >= 10.0:
+        actions.append(
+            f"High network RTT ({telemetry.network_rtt_ms:.1f} ms >= 10.0 ms) detected between application and database tier. "
+            "Deploy local PgBouncer connection pooling, enable local Redis read-through caching, and audit chatty "
+            "N+1 Gitaly/PostgreSQL RPC round-trips."
+        )
+        rationale.append(
+            f"Network RTT ({telemetry.network_rtt_ms:.1f} ms) amplifies multi-query transactions. Each sequential database "
+            "round-trip incurs severe latency overhead."
+        )
+    else:
+        rationale.append(
+            f"Network RTT ({telemetry.network_rtt_ms:.1f} ms) is within acceptable LAN/local boundary (<10.0 ms)."
+        )
+
+    return LiveTuningRecommendation(
+        gitlab_rb_overrides=overrides,
+        table_storage_sql=table_storage_sql,
+        hardware_and_network_actions=actions,
+        rationale=rationale,
+    )
+
+
+def format_live_tuning_markdown(rec: LiveTuningRecommendation) -> str:
+    """Format live tuning recommendations as readable markdown report."""
+    lines: list[str] = []
+    lines.append("# Live Workload-Driven PostgreSQL & GitLab Tuning Advisory")
+    lines.append("")
+    lines.append("## 1. /etc/gitlab/gitlab.rb Configuration Overrides")
+    lines.append("```ruby")
+    for k, v in rec.gitlab_rb_overrides.items():
+        if isinstance(v, str):
+            lines.append(f'{k} = "{v}"')
+        else:
+            lines.append(f"{k} = {v}")
+    lines.append("```")
+    lines.append("")
+    lines.append("## 2. Leaf Partition Autovacuum Storage Parameters")
+    if rec.table_storage_sql:
+        lines.append("```sql")
+        for sql in rec.table_storage_sql:
+            lines.append(sql)
+        lines.append("```")
+    else:
+        lines.append("*No per-table autovacuum overrides required at current tuple churn rates.*")
+    lines.append("")
+    lines.append("## 3. Hardware, Storage & Network Actions")
+    if rec.hardware_and_network_actions:
+        for action in rec.hardware_and_network_actions:
+            lines.append(f"- {action}")
+    else:
+        lines.append("*No hardware or network bottlenecks flagged.*")
+    lines.append("")
+    lines.append("## 4. Engineering Rationale")
+    for r in rec.rationale:
+        lines.append(f"- {r}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI entrypoint for support-pg-advisor."""
+    parser = argparse.ArgumentParser(
+        prog="support-pg-advisor",
+        description="PostgreSQL & Linux workload-driven live configuration and tuning advisor.",
+    )
+    parser.add_argument("--ram-gb", type=int, default=32, help="Host RAM in GB (default: 32)")
+    parser.add_argument("--vcpus", type=int, default=8, help="Host vCPUs (default: 8)")
+    parser.add_argument(
+        "--storage-type",
+        choices=["nvme", "ssd", "hdd"],
+        default="ssd",
+        help="Storage medium: nvme, ssd, hdd (default: ssd)",
+    )
+    parser.add_argument(
+        "--max-connections",
+        type=int,
+        default=200,
+        help="Max PostgreSQL connections (default: 200)",
+    )
+    parser.add_argument(
+        "--active-workers",
+        type=int,
+        default=4,
+        help="Concurrent active query worker threads (default: 4)",
+    )
+    parser.add_argument(
+        "--temp-bytes-written-per-hour",
+        type=int,
+        default=0,
+        help="Temp bytes written per hour from pg_stat_database (default: 0)",
+    )
+    parser.add_argument(
+        "--top-sort-spill-mb",
+        type=int,
+        default=0,
+        help="Peak disk sort spill in MB from EXPLAIN (ANALYZE, BUFFERS) (default: 0)",
+    )
+    parser.add_argument(
+        "--dead-tuple-ratio",
+        type=float,
+        default=0.0,
+        help="Max dead tuple ratio on hot tables (default: 0.0)",
+    )
+    parser.add_argument(
+        "--hot-table",
+        action="append",
+        dest="hot_tables",
+        default=None,
+        help="Hot table name requiring aggressive autovacuum (repeatable)",
+    )
+    parser.add_argument(
+        "--checkpoints-req-per-hour",
+        type=int,
+        default=0,
+        help="Forced WAL checkpoints per hour from pg_stat_bgwriter (default: 0)",
+    )
+    parser.add_argument(
+        "--zero-scan-index-ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of database size consumed by zero-scan indexes (default: 0.0)",
+    )
+    parser.add_argument(
+        "--network-rtt-ms",
+        type=float,
+        default=0.5,
+        help="Network RTT between app and DB tier in ms (default: 0.5)",
+    )
+    parser.add_argument(
+        "--live-example",
+        action="store_true",
+        help="Run Project 77K empirical benchmark telemetry scenario (32GB, 8vCPUs, 16MB spill, 53.5% zero-scan indexes)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["markdown", "text", "json"],
+        default="markdown",
+        help="Output format: markdown, text, json (default: markdown)",
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.live_example:
+        telemetry = LiveWorkloadTelemetry(
+            ram_gb=32,
+            vcpus=8,
+            storage_type="ssd",
+            max_connections=200,
+            active_workers=4,
+            temp_bytes_written_per_hour=820_838_400,
+            top_sort_spill_mb=16,
+            dead_tuple_ratio_max=0.145,
+            hot_table_names=("issues", "notes", "gitlab_partitions_dynamic.ci_builds_100"),
+            checkpoints_req_per_hour=6,
+            zero_scan_index_ratio=0.535,
+            network_rtt_ms=0.5,
+        )
+    else:
+        hot_tables: tuple[str, ...] = tuple(args.hot_tables) if args.hot_tables else ()
+        storage_type: Literal["nvme", "ssd", "hdd"] = args.storage_type
+        telemetry = LiveWorkloadTelemetry(
+            ram_gb=args.ram_gb,
+            vcpus=args.vcpus,
+            storage_type=storage_type,
+            max_connections=args.max_connections,
+            active_workers=args.active_workers,
+            temp_bytes_written_per_hour=args.temp_bytes_written_per_hour,
+            top_sort_spill_mb=args.top_sort_spill_mb,
+            dead_tuple_ratio_max=args.dead_tuple_ratio,
+            hot_table_names=hot_tables,
+            checkpoints_req_per_hour=args.checkpoints_req_per_hour,
+            zero_scan_index_ratio=args.zero_scan_index_ratio,
+            network_rtt_ms=args.network_rtt_ms,
+        )
+
+    rec = calculate_live_workload_tunings(telemetry)
+
+    if args.format == "json":
+        data = asdict(rec)
+        print(json.dumps(data, indent=2))
+    elif args.format == "text":
+        for k, v in rec.gitlab_rb_overrides.items():
+            print(f"{k} = {v}")
+        if rec.table_storage_sql:
+            print("\nStorage SQL:")
+            for sql in rec.table_storage_sql:
+                print(sql)
+        if rec.hardware_and_network_actions:
+            print("\nHardware & Network Actions:")
+            for action in rec.hardware_and_network_actions:
+                print(f"- {action}")
+        print("\nRationale:")
+        for r in rec.rationale:
+            print(f"- {r}")
+    else:  # markdown
+        print(format_live_tuning_markdown(rec))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

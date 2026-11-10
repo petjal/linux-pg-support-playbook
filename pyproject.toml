@@ -21,6 +21,9 @@ dev = [
     "ruff>=0.5",
 ]
 
+[project.scripts]
+support-pg-advisor = "support_playbook.pg_advisor:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

@@ -6,14 +6,22 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from support_playbook.log_correlator import LogCorrelator
 from support_playbook.pg_advisor import (
     IndexTelemetryRow,
+    LiveWorkloadTelemetry,
     MemoryTelemetry,
     MountTelemetryRow,
     NetworkInterfaceTelemetry,
     PgAdvisor,
     TableTelemetryRow,
+    calculate_live_workload_tunings,
+    format_live_tuning_markdown,
+)
+from support_playbook.pg_advisor import (
+    main as pg_advisor_main,
 )
 from support_playbook.sql_pushdown_demo import run_sql_pushdown_benchmark
 
@@ -570,20 +578,166 @@ def test_repository_no_pii_or_path_bleed() -> None:
     tracked_files = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
     assert len(tracked_files) > 0
 
-    banned_phone = re.compile(r"\b\d{3}[-.]\d{3}[-.]\d{4}\b")
-    banned_customers = re.compile(
-        r"\b(cisco|citigroup|netapp|comcast|broadcom|synopsys|black\s*duck|tebuco)\b",
-        re.IGNORECASE,
-    )
-    banned_paths = re.compile(
-        r"(/home/(?!appuser\b|support_test\b|gitlab_support\b|corpuser_|user\b|developer\b)[a-zA-Z0-9_-]+|/dev/shm|antigravity-cli/brain)"
-    )
+    banned_patterns = [
+        (re.compile(r"\b\d{3}[-.]\d{3}[-.]\d{4}\b"), "Phone number found"),
+        (
+            re.compile(
+                r"\b(cisco|citigroup|netapp|comcast|broadcom|synopsys|black\s*duck|tebuco)\b",
+                re.IGNORECASE,
+            ),
+            "Customer/internal name found",
+        ),
+        (
+            re.compile(
+                r"(/home/(?!appuser\b|support_test\b|gitlab_support\b|corpuser_|user\b|developer\b)[a-zA-Z0-9_-]+|/dev/shm|antigravity-cli/brain)"
+            ),
+            "Local workstation path found",
+        ),
+        (
+            re.compile(r"\b" + "".join(["r", "t", "f", "m"]) + r"\b", re.IGNORECASE),
+            "Banned slang found",
+        ),
+    ]
 
     for rel_path in tracked_files:
         if rel_path == "tests/test_support_playbook.py":
             continue
         content = (repo_root / rel_path).read_text(encoding="utf-8", errors="ignore")
-        assert banned_phone.search(content) is None, f"Phone number found in {rel_path}"
-        assert banned_customers.search(content) is None, f"Customer/internal name found in {rel_path}"
-        assert banned_paths.search(content) is None, f"Local workstation path found in {rel_path}"
+        for pattern, failure_msg in banned_patterns:
+            assert pattern.search(content) is None, f"{failure_msg} in {rel_path}"
+
+
+def test_calculate_live_workload_tunings_project_77k() -> None:
+    """Verify workload-driven tuning calculator matches empirical Project 77K benchmarks."""
+    telemetry = LiveWorkloadTelemetry(
+        ram_gb=32,
+        vcpus=8,
+        storage_type="ssd",
+        max_connections=200,
+        active_workers=4,
+        top_sort_spill_mb=16,
+        dead_tuple_ratio_max=0.145,
+        hot_table_names=("issues", "notes", "gitlab_partitions_dynamic.ci_builds_100"),
+        checkpoints_req_per_hour=6,
+        zero_scan_index_ratio=0.535,
+        network_rtt_ms=0.5,
+    )
+
+    rec = calculate_live_workload_tunings(telemetry)
+
+    # 1. /etc/gitlab/gitlab.rb overrides
+    assert rec.gitlab_rb_overrides["postgresql['shared_buffers']"] == "8GB"
+    assert rec.gitlab_rb_overrides["postgresql['effective_cache_size']"] == "24GB"
+    assert rec.gitlab_rb_overrides["postgresql['work_mem']"] == "32MB"
+    assert rec.gitlab_rb_overrides["postgresql['max_wal_size']"] == "16GB"
+    assert rec.gitlab_rb_overrides["postgresql['checkpoint_completion_target']"] == 0.9
+    assert rec.gitlab_rb_overrides["postgresql['random_page_cost']"] == 1.1
+    assert rec.gitlab_rb_overrides["postgresql['effective_io_concurrency']"] == 200
+
+    # 2. Table storage SQL targeting physical leaf partitions
+    assert len(rec.table_storage_sql) == 3
+    assert (
+        rec.table_storage_sql[0]
+        == "ALTER TABLE issues SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_analyze_scale_factor = 0.005, autovacuum_vacuum_cost_limit = 2000);"
+    )
+    assert (
+        rec.table_storage_sql[1]
+        == "ALTER TABLE notes SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_analyze_scale_factor = 0.005, autovacuum_vacuum_cost_limit = 2000);"
+    )
+    assert (
+        rec.table_storage_sql[2]
+        == "ALTER TABLE gitlab_partitions_dynamic.ci_builds_100 SET (autovacuum_vacuum_scale_factor = 0.01, autovacuum_analyze_scale_factor = 0.005, autovacuum_vacuum_cost_limit = 2000);"
+    )
+
+    # 3. Actions & Rationale
+    assert any("write amplification" in a.lower() for a in rec.hardware_and_network_actions)
+    assert any("53.5%" in a for a in rec.hardware_and_network_actions)
+    assert any("checkpoint" in a.lower() for a in rec.hardware_and_network_actions)
+    assert len(rec.rationale) >= 5
+
+    # Markdown format check
+    md = format_live_tuning_markdown(rec)
+    assert "postgresql['shared_buffers'] = \"8GB\"" in md
+    assert "ALTER TABLE gitlab_partitions_dynamic.ci_builds_100" in md
+
+    # PgAdvisor method delegation
+    advisor = PgAdvisor()
+    rec_from_method = advisor.calculate_live_workload_tunings(telemetry)
+    assert rec_from_method == rec
+
+
+def test_calculate_live_workload_tunings_storage_types_and_network_rtt() -> None:
+    """Verify handling of rotational HDD storage and high cross-tier network RTT."""
+    telemetry = LiveWorkloadTelemetry(
+        ram_gb=16,
+        vcpus=4,
+        storage_type="hdd",
+        max_connections=100,
+        active_workers=2,
+        network_rtt_ms=15.0,
+        checkpoints_req_per_hour=1,
+    )
+
+    rec = calculate_live_workload_tunings(telemetry)
+
+    # HDD specific parameters
+    assert rec.gitlab_rb_overrides["postgresql['random_page_cost']"] == 4.0
+    assert rec.gitlab_rb_overrides["postgresql['effective_io_concurrency']"] == 2
+    assert rec.gitlab_rb_overrides["postgresql['max_wal_size']"] == "4GB"
+
+    # Hardware actions should flag HDD and network RTT
+    assert any("rotational HDD" in a for a in rec.hardware_and_network_actions)
+    assert any("15.0 ms" in a and "PgBouncer" in a for a in rec.hardware_and_network_actions)
+
+
+def test_calculate_live_workload_tunings_oom_cap_and_temp_bytes() -> None:
+    """Verify work_mem is safely capped against concurrent worker OOM and handles temp_bytes."""
+    telemetry = LiveWorkloadTelemetry(
+        ram_gb=4,
+        vcpus=2,
+        storage_type="ssd",
+        active_workers=8,
+        temp_bytes_written_per_hour=500_000_000,
+        top_sort_spill_mb=512,  # Excessive spill that would risk host OOM if unconstrained
+    )
+
+    rec = calculate_live_workload_tunings(telemetry)
+
+    # Total RAM 4096 MB // (8 workers * 4) = 128 MB max safe cap
+    assert rec.gitlab_rb_overrides["postgresql['work_mem']"] == "128MB"
+    assert any("safety cap: 128MB" in r for r in rec.rationale)
+
+
+def test_support_pg_advisor_cli_main(capsys: pytest.CaptureFixture[str]) -> None:
+    """Verify CLI entrypoint support-pg-advisor with JSON, text, and markdown output."""
+    import json
+
+    # 1. Test live-example in JSON
+    rc_json = pg_advisor_main(["--live-example", "--format", "json"])
+    assert rc_json == 0
+    captured_json = capsys.readouterr().out
+    data = json.loads(captured_json)
+    assert data["gitlab_rb_overrides"]["postgresql['shared_buffers']"] == "8GB"
+    assert data["gitlab_rb_overrides"]["postgresql['work_mem']"] == "32MB"
+    assert len(data["table_storage_sql"]) == 3
+
+    # 2. Test live-example in markdown
+    rc_md = pg_advisor_main(["--live-example", "--format", "markdown"])
+    assert rc_md == 0
+    captured_md = capsys.readouterr().out
+    assert "# Live Workload-Driven PostgreSQL & GitLab Tuning Advisory" in captured_md
+    assert "postgresql['shared_buffers'] = \"8GB\"" in captured_md
+
+    # 3. Test explicit arguments in text format
+    rc_text = pg_advisor_main([
+        "--ram-gb", "16",
+        "--vcpus", "4",
+        "--top-sort-spill-mb", "8",
+        "--format", "text",
+    ])
+    assert rc_text == 0
+    captured_text = capsys.readouterr().out
+    assert "postgresql['shared_buffers'] = 4GB" in captured_text
+    assert "postgresql['work_mem'] = 16MB" in captured_text
+
 

@@ -13,6 +13,8 @@ if TYPE_CHECKING:
         AutovacuumAuditResult,
         IndexAuditResult,
         IndexTelemetryRow,
+        LiveTuningRecommendation,
+        LiveWorkloadTelemetry,
         MemoryAuditResult,
         MemoryTelemetry,
         MountTelemetryRow,
@@ -20,6 +22,8 @@ if TYPE_CHECKING:
         PgAdvisor,
         StorageAuditResult,
         TableTelemetryRow,
+        calculate_live_workload_tunings,
+        format_live_tuning_markdown,
     )
     from support_playbook.sql_pushdown_demo import (
         BenchmarkResult,
@@ -39,6 +43,10 @@ __all__ = [
     "IndexAuditResult",
     "TableTelemetryRow",
     "AutovacuumAuditResult",
+    "LiveWorkloadTelemetry",
+    "LiveTuningRecommendation",
+    "calculate_live_workload_tunings",
+    "format_live_tuning_markdown",
     "MountTelemetryRow",
     "NetworkInterfaceTelemetry",
     "StorageAuditResult",
@@ -63,6 +71,10 @@ def __getattr__(name: str) -> object:
         "MountTelemetryRow",
         "NetworkInterfaceTelemetry",
         "StorageAuditResult",
+        "LiveWorkloadTelemetry",
+        "LiveTuningRecommendation",
+        "calculate_live_workload_tunings",
+        "format_live_tuning_markdown",
     ):
         import support_playbook.pg_advisor as pg_mod
         return getattr(pg_mod, name)
