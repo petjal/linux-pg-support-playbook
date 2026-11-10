@@ -741,3 +741,25 @@ def test_support_pg_advisor_cli_main(capsys: pytest.CaptureFixture[str]) -> None
     assert "postgresql['work_mem'] = 16MB" in captured_text
 
 
+def test_pg_field_diagnostics_sql_invariants() -> None:
+    """Verify sql/pg_field_diagnostics.sql enforces read-only mode, version guards, and safe index filters."""
+    repo_root = Path(__file__).resolve().parent.parent
+    sql_path = repo_root / "sql" / "pg_field_diagnostics.sql"
+    content = sql_path.read_text(encoding="utf-8")
+
+    assert "\\set ON_ERROR_STOP on" in content
+    assert "SET default_transaction_read_only = on;" in content
+    assert "pg_blocking_pids(" in content
+    assert "has_pgss_ready \\gset" in content
+    assert "\\if :has_pgss_ready" in content
+    assert "is_pg_17_or_newer \\gset" in content
+    assert "\\if :is_pg_17_or_newer" in content
+    assert "ic.relkind = 'i'" in content
+    assert "NOT idx.indisexclusion" in content
+    assert "NOT idx.indisreplident" in content
+    assert "FROM pg_catalog.pg_inherits" in content
+    assert "FROM pg_catalog.pg_stat_database" in content
+    assert "index_to_heap_pct" in content
+
+
+
