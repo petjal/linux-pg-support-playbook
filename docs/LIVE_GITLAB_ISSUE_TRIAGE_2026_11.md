@@ -608,8 +608,9 @@ Querying `pg_stat_user_indexes` and `pg_statio_user_indexes` after our stress wo
 - **Total Database Size:** 1,641 MB
 - **Total User Tables:** 1,704
 - **Total User Indexes:** 7,119
-- **Zero-Scan Indexes (`idx_scan = 0`):** **7,054 (99.09% of all indexes!)**
+- **Zero-Scan Indexes (`idx_scan = 0` in 3-Query Benchmark):** **7,054 (99.09% of all indexes!)**
 - **Zero-Scan Disk Storage Footprint:** **878 MB (53.5% of the entire database)**
+- **Production Sampling Caveat:** Zero-scan counts in a controlled 3-query lab demonstrate catalog-planning and write-amplification overhead; in self-managed GitLab production, always sample `pg_stat_user_indexes` across a full 30-day billing/reporting cycle across the primary and all read replicas (and verify `gitlab-rake db:migrate` upgrade schema expectations) before executing `DROP INDEX CONCURRENTLY`.
 
 #### Top 20 Zero-Scan Indexes on High-Write Tables
 Every insert or update to these tables forced PostgreSQL to modify b-tree pages that were never once read by any query:
