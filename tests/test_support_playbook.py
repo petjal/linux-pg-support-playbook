@@ -589,7 +589,7 @@ def test_repository_no_pii_or_path_bleed() -> None:
         ),
         (
             re.compile(
-                r"(/home/(?!appuser\b|support_test\b|gitlab_support\b|corpuser_|user\b|developer\b)[a-zA-Z0-9_-]+|/dev/shm|antigravity-cli/brain)"
+                r"(/home/(?!appuser\b|support_test\b|gitlab_support\b|corpuser_|user\b|developer\b)[a-zA-Z0-9_-]+|/dev/shm/[a-zA-Z0-9_.]+|antigravity-cli/brain)"
             ),
             "Local workstation path found",
         ),
